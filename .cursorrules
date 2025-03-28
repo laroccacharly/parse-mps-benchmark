@@ -1,0 +1,10 @@
+You have access to highspy solver to give you a baseline to compare your results. 
+Give a time limit of 3 seconds for you algorithms to not waste time and iterate quickly. 
+Use prints to help you debug and iterate. 
+You must parse the MPS file to convert it to a format that can be used by your simplex solver. 
+Check you objective value to what highspy returns. 
+add prints to see you runtime at different points in your algorithm
+
+always you uv. 
+if you need dependencies, add them with uv add mypackage. You can use pandas, polars, numpy, scipy, etc. 
+Run the code with uv run main.py
