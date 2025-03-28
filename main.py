@@ -5,10 +5,8 @@ import time
 from parse_mps import parse_mps
 import os
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 import json
-from scipy.sparse import csr_matrix, coo_matrix
+from scipy.sparse import coo_matrix
 from typing import Optional, Tuple, List, Dict, Any
 from lp_model import LpData
 
@@ -135,22 +133,21 @@ def solve_with_parsed_data(lp_data: LpData) -> Dict[str, Any]:
     current_start = 0
 
     # Process equality constraints (Ax = b -> b <= Ax <= b)
-    if lp_data.A_eq is not None and num_eq > 0:
-        A_eq = lp_data.A_eq # Already csr_matrix
+    # Reconstruct A_eq from COO components if they exist
+    if lp_data.A_eq_row is not None and lp_data.A_eq_col is not None and lp_data.A_eq_data is not None and num_eq > 0:
+        A_eq_coo = coo_matrix((lp_data.A_eq_data, (lp_data.A_eq_row, lp_data.A_eq_col)), shape=(num_eq, num_var))
+        A_eq_csr = A_eq_coo.tocsr() # Convert to CSR for HiGHS
         b_eq = lp_data.b_eq
         for i in range(num_eq):
-            start = A_eq.indptr[i]
-            end = A_eq.indptr[i+1]
-            row_indices = A_eq.indices[start:end]
-            row_values = A_eq.data[start:end]
+            start = A_eq_csr.indptr[i]
+            end = A_eq_csr.indptr[i+1]
+            row_indices = A_eq_csr.indices[start:end]
+            row_values = A_eq_csr.data[start:end]
             
-            if len(row_indices) == 0: # Skip empty rows if any
-                # Note: HiGHS might require explicit handling or might ignore these
-                # For simplicity, we add the constraint bounds but no coefficients
+            if len(row_indices) == 0: # Handle empty rows
                  constraint_starts.append(current_start)
                  constraint_lhs.append(b_eq[i])
                  constraint_rhs.append(b_eq[i])
-                 # current_start remains the same as no indices/values added
                  continue
 
             constraint_starts.append(current_start)
@@ -159,23 +156,29 @@ def solve_with_parsed_data(lp_data: LpData) -> Dict[str, Any]:
             constraint_lhs.append(b_eq[i]) # Equality lower bound
             constraint_rhs.append(b_eq[i]) # Equality upper bound
             current_start += len(row_indices)
+    elif num_eq > 0: # Handle case where b_eq exists but A_eq components are None/empty
+        b_eq = lp_data.b_eq
+        for i in range(num_eq):
+            constraint_starts.append(current_start)
+            constraint_lhs.append(b_eq[i])
+            constraint_rhs.append(b_eq[i])
 
     # Process inequality constraints (Ax <= b -> -inf <= Ax <= b)
-    if lp_data.A_ineq is not None and num_ineq > 0:
-        A_ineq = lp_data.A_ineq # Already csr_matrix
+    # Reconstruct A_ineq from COO components if they exist
+    if lp_data.A_ineq_row is not None and lp_data.A_ineq_col is not None and lp_data.A_ineq_data is not None and num_ineq > 0:
+        A_ineq_coo = coo_matrix((lp_data.A_ineq_data, (lp_data.A_ineq_row, lp_data.A_ineq_col)), shape=(num_ineq, num_var))
+        A_ineq_csr = A_ineq_coo.tocsr() # Convert to CSR for HiGHS
         b_ineq = lp_data.b_ineq
         for i in range(num_ineq):
-            start = A_ineq.indptr[i]
-            end = A_ineq.indptr[i+1]
-            row_indices = A_ineq.indices[start:end]
-            row_values = A_ineq.data[start:end]
+            start = A_ineq_csr.indptr[i]
+            end = A_ineq_csr.indptr[i+1]
+            row_indices = A_ineq_csr.indices[start:end]
+            row_values = A_ineq_csr.data[start:end]
             
-            if len(row_indices) == 0: # Skip empty rows if any
-                 # Add bounds for empty row: -inf <= 0 <= b_ineq[i]
+            if len(row_indices) == 0: # Handle empty rows
                  constraint_starts.append(current_start)
                  constraint_lhs.append(-highspy.kHighsInf)
                  constraint_rhs.append(b_ineq[i])
-                 # current_start remains the same
                  continue
             
             constraint_starts.append(current_start)
@@ -184,13 +187,26 @@ def solve_with_parsed_data(lp_data: LpData) -> Dict[str, Any]:
             constraint_lhs.append(-highspy.kHighsInf) # Inequality lower bound (-inf)
             constraint_rhs.append(b_ineq[i])        # Inequality upper bound
             current_start += len(row_indices)
+    elif num_ineq > 0: # Handle case where b_ineq exists but A_ineq components are None/empty
+        b_ineq = lp_data.b_ineq
+        for i in range(num_ineq):
+            constraint_starts.append(current_start)
+            constraint_lhs.append(-highspy.kHighsInf)
+            constraint_rhs.append(b_ineq[i])
 
     # Add all constraints at once using addRows
     num_cons = len(constraint_starts) # Use length of starts to count actual constraints added
     if num_cons > 0:
-        model.addRows(num_cons, np.array(constraint_lhs), np.array(constraint_rhs), 
-                        len(constraint_indices), np.array(constraint_starts), 
-                        np.array(constraint_indices, dtype=np.int32), np.array(constraint_values))
+        # Ensure indices and starts are numpy arrays of the correct type for HiGHS
+        h_indices = np.array(constraint_indices, dtype=np.int32)
+        h_starts = np.array(constraint_starts, dtype=np.int32)
+        h_values = np.array(constraint_values, dtype=np.float64)
+        h_lhs = np.array(constraint_lhs, dtype=np.float64)
+        h_rhs = np.array(constraint_rhs, dtype=np.float64)
+        
+        model.addRows(num_cons, h_lhs, h_rhs, 
+                        len(h_indices), h_starts, 
+                        h_indices, h_values)
 
     # Add objective offset if it exists in the data
     obj_offset = lp_data.obj_offset
@@ -218,17 +234,19 @@ def solve_with_parsed_data(lp_data: LpData) -> Dict[str, Any]:
     return result_dict
 
 def save_lp_to_parquet(lp_data: LpData, instance_name: str) -> Tuple[str, float]:
-    """Saves LpData components to Parquet files."""
+    """Saves LpData components to Parquet files inside a 'data' directory."""
     start_time = time.time()
-    output_dir = f"{instance_name}_parquet"
+    # Define the base data directory
+    base_data_dir = "data"
+    # Create the instance-specific directory path
+    output_dir = os.path.join(base_data_dir, f"{instance_name}_parquet")
+    # Create the base and instance-specific directories (exist_ok=True handles both)
     os.makedirs(output_dir, exist_ok=True)
     print(f"Saving data to directory: {output_dir}")
 
     metadata = {
         'n_vars': lp_data.n_vars,
-        # Use properties for n_eq/n_ineq to be safe
-        'n_eq': lp_data.n_eq, 
-        'n_ineq': lp_data.n_ineq,
+        # n_eq/n_ineq are derived properties in LpData, no need to store explicitly
         'obj_offset': lp_data.obj_offset 
     }
 
@@ -246,35 +264,38 @@ def save_lp_to_parquet(lp_data: LpData, instance_name: str) -> Tuple[str, float]
     if lp_data.b_ineq.size > 0:
         pd.DataFrame({'b_ineq': lp_data.b_ineq}).to_parquet(os.path.join(output_dir, 'b_ineq.parquet'))
 
-    # Save sparse matrices (converting CSR to COO format for saving)
-    def save_sparse_matrix(matrix: Optional[csr_matrix], filename: str, shape: Tuple[int, int]):
-        if matrix is not None and matrix.nnz > 0:
-            coo = matrix.tocoo()
-            df = pd.DataFrame({'row': coo.row, 'col': coo.col, 'data': coo.data})
+    # Save sparse matrix components (COO format) into single files
+    def save_coo_matrix(row: Optional[np.ndarray], col: Optional[np.ndarray], data: Optional[np.ndarray], filename: str):
+        # Ensure all components are present and non-empty before saving
+        if row is not None and col is not None and data is not None and row.size > 0:
+            # Assert they have the same size, just in case
+            assert row.size == col.size == data.size, f"COO component size mismatch for {filename}"
+            df = pd.DataFrame({'row': row, 'col': col, 'data': data})
             df.to_parquet(filename)
-            metadata[f'{os.path.basename(filename)}_shape'] = shape
-        else: # Save empty structure if matrix is None or empty
-            df = pd.DataFrame({'row': [], 'col': [], 'data': []})
-            df.to_parquet(filename)
+        # else: If any component is None or empty, don't save the file. Loader will handle missing files.
 
-    # Matrices are already sparse or None
-    save_sparse_matrix(lp_data.A_eq, os.path.join(output_dir, 'A_eq.parquet'), (metadata['n_eq'], metadata['n_vars']))
-    save_sparse_matrix(lp_data.A_ineq, os.path.join(output_dir, 'A_ineq.parquet'), (metadata['n_ineq'], metadata['n_vars']))
-
-    # Re-save metadata in case shape info was added for empty matrices
-    with open(os.path.join(output_dir, 'metadata.json'), 'w') as f:
-        json.dump(metadata, f)
+    save_coo_matrix(lp_data.A_eq_row, lp_data.A_eq_col, lp_data.A_eq_data, os.path.join(output_dir, 'A_eq_coo.parquet'))
+    save_coo_matrix(lp_data.A_ineq_row, lp_data.A_ineq_col, lp_data.A_ineq_data, os.path.join(output_dir, 'A_ineq_coo.parquet'))
 
     save_time = time.time() - start_time
     print(f"Finished saving to Parquet in {save_time:.4f} seconds")
+    # Return the path relative to the workspace root
     return output_dir, save_time
 
 
 def load_lp_from_parquet(instance_name: str) -> Tuple[LpData, float]:
-    """Loads LP data components from Parquet files and returns an LpData object."""
+    """Loads LP data components from Parquet files inside a 'data' directory."""
     start_time = time.time()
-    data_dir = f"{instance_name}_parquet"
+    # Define the path to the instance-specific directory within 'data'
+    base_data_dir = "data"
+    data_dir = os.path.join(base_data_dir, f"{instance_name}_parquet")
     print(f"Loading data from directory: {data_dir}")
+    
+    # Check if the directory exists before proceeding
+    if not os.path.isdir(data_dir):
+        print(f"Error: Data directory not found: {data_dir}")
+        raise FileNotFoundError(f"Data directory not found: {data_dir}")
+        
     lp_data_dict = {}
 
     # Load metadata
@@ -282,7 +303,6 @@ def load_lp_from_parquet(instance_name: str) -> Tuple[LpData, float]:
         metadata = json.load(f)
 
     lp_data_dict['n_vars'] = metadata['n_vars']
-    # n_eq/n_ineq will be inferred by LpData model from matrix shapes
     lp_data_dict['obj_offset'] = metadata.get('obj_offset', 0.0)
 
     # Load vectors
@@ -302,27 +322,23 @@ def load_lp_from_parquet(instance_name: str) -> Tuple[LpData, float]:
     else:
         lp_data_dict['b_ineq'] = np.array([])
 
-    # Load sparse matrices
-    def load_sparse_matrix(filename: str, shape: Tuple[int, int]) -> Optional[csr_matrix]:
+    # Load sparse matrix COO components from single files
+    def load_coo_matrix(filename: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
          if not os.path.exists(filename):
-             print(f"Warning: File not found {filename}, returning None.")
-             return None # Or appropriate empty matrix
+             return None, None, None
          df = pd.read_parquet(filename)
          if df.empty:
-             # Use shape info from metadata if saved
-             actual_shape = metadata.get(f'{os.path.basename(filename)}_shape', shape)
-             # Return an empty CSR matrix with the correct shape
-             return csr_matrix(actual_shape)
-         coo = coo_matrix((df['data'], (df['row'], df['col'])), shape=shape)
-         return coo.tocsr() # Convert back to CSR for consistency with solver function
+             # Return None for all components if the file was empty
+             return None, None, None
+         # Check if expected columns exist
+         if 'row' in df.columns and 'col' in df.columns and 'data' in df.columns:
+            return df['row'].to_numpy(), df['col'].to_numpy(), df['data'].to_numpy()
+         else:
+             print(f"Warning: Parquet file {filename} missing expected columns ('row', 'col', 'data'). Returning None.")
+             return None, None, None
 
-    # Use metadata shapes for loading
-    n_eq = metadata['n_eq']
-    n_ineq = metadata['n_ineq']
-    n_vars = metadata['n_vars']
-    
-    lp_data_dict['A_eq'] = load_sparse_matrix(os.path.join(data_dir, 'A_eq.parquet'), (n_eq, n_vars))
-    lp_data_dict['A_ineq'] = load_sparse_matrix(os.path.join(data_dir, 'A_ineq.parquet'), (n_ineq, n_vars))
+    lp_data_dict['A_eq_row'], lp_data_dict['A_eq_col'], lp_data_dict['A_eq_data'] = load_coo_matrix(os.path.join(data_dir, 'A_eq_coo.parquet'))
+    lp_data_dict['A_ineq_row'], lp_data_dict['A_ineq_col'], lp_data_dict['A_ineq_data'] = load_coo_matrix(os.path.join(data_dir, 'A_ineq_coo.parquet'))
 
     # Add col_names if needed (assuming not saved currently)
     lp_data_dict['col_names'] = None 

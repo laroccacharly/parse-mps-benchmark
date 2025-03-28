@@ -186,6 +186,7 @@ def parse_mps(path: str) -> LpData: # Update return type hint
         full_A_coo = coo_matrix((data, (row_ind, col_ind)), shape=(n_constraints_total, n_vars))
         full_A = full_A_coo.tocsr() # Convert to CSR for efficient row slicing
     else:
+        # Create empty COO components if no constraints
         full_A = csr_matrix((n_constraints_total, n_vars))
 
     # Prepare indices for splitting
@@ -196,47 +197,68 @@ def parse_mps(path: str) -> LpData: # Update return type hint
     n_eq = len(eq_indices)
     n_ineq = len(l_indices) + len(g_indices)
     
-    A_eq: Optional[csr_matrix] = None
+    # Initialize COO components for A_eq and A_ineq
+    A_eq_row: Optional[np.ndarray] = None
+    A_eq_col: Optional[np.ndarray] = None
+    A_eq_data: Optional[np.ndarray] = None
     b_eq: np.ndarray = np.array([])
-    A_ineq: Optional[csr_matrix] = None
+    
+    A_ineq_row: Optional[np.ndarray] = None
+    A_ineq_col: Optional[np.ndarray] = None
+    A_ineq_data: Optional[np.ndarray] = None
     b_ineq: np.ndarray = np.array([])
 
     if n_eq > 0:
-        A_eq = full_A[eq_indices, :]
+        A_eq_csr = full_A[eq_indices, :]
+        A_eq_coo = A_eq_csr.tocoo()
+        A_eq_row = A_eq_coo.row
+        A_eq_col = A_eq_coo.col
+        A_eq_data = A_eq_coo.data
         b_eq = np.array([constraint_rhs[idx] for idx in eq_indices])
         
     if n_ineq > 0:
         # Combine L and G constraints into a single inequality matrix (Ax <= b)
-        rows_L = full_A[l_indices, :] if l_indices else None
+        rows_L_csr = full_A[l_indices, :] if l_indices else None
         rhs_L = np.array([constraint_rhs[idx] for idx in l_indices]) if l_indices else np.array([])
         
-        rows_G = -full_A[g_indices, :] if g_indices else None # Negate G constraints
+        rows_G_csr = -full_A[g_indices, :] if g_indices else None # Negate G constraints
         rhs_G = np.array([-constraint_rhs[idx] for idx in g_indices]) if g_indices else np.array([]) # Negate G rhs
         
         # Stack L and G vertically if both exist
-        if rows_L is not None and rows_G is not None:
-            A_ineq = vstack([rows_L, rows_G], format='csr')
+        A_ineq_csr: Optional[csr_matrix] = None
+        if rows_L_csr is not None and rows_G_csr is not None:
+            A_ineq_csr = vstack([rows_L_csr, rows_G_csr], format='csr')
             b_ineq = np.concatenate([rhs_L, rhs_G])
-        elif rows_L is not None:
-            A_ineq = rows_L
+        elif rows_L_csr is not None:
+            A_ineq_csr = rows_L_csr
             b_ineq = rhs_L
-        elif rows_G is not None:
-            A_ineq = rows_G
+        elif rows_G_csr is not None:
+            A_ineq_csr = rows_G_csr
             b_ineq = rhs_G
-        # Else (if n_ineq > 0 but both are None - should not happen), A_ineq/b_ineq remain None/[]
+
+        if A_ineq_csr is not None:
+            A_ineq_coo = A_ineq_csr.tocoo()
+            A_ineq_row = A_ineq_coo.row
+            A_ineq_col = A_ineq_coo.col
+            A_ineq_data = A_ineq_coo.data
+        # Else: A_ineq components remain None, b_ineq remains empty if n_ineq was > 0 but no rows resulted
         
     print(f"Constraint splitting completed in {time.time() - split_start_time:.2f} seconds")
     print(f"Total parsing time: {time.time() - parse_start_time:.2f} seconds")
     
-    # Create and return LpData instance
+    # Create and return LpData instance with COO components
     try:
         lp_data_obj = LpData(
             n_vars=n_vars,
             c=c,
             bounds=(lb, ub),
-            A_eq=A_eq, 
+            A_eq_row=A_eq_row, 
+            A_eq_col=A_eq_col,
+            A_eq_data=A_eq_data,
             b_eq=b_eq,
-            A_ineq=A_ineq,
+            A_ineq_row=A_ineq_row,
+            A_ineq_col=A_ineq_col,
+            A_ineq_data=A_ineq_data,
             b_ineq=b_ineq,
             obj_offset=0.0, # Default obj_offset
             col_names=col_names,
