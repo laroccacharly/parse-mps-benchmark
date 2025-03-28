@@ -1,8 +1,11 @@
 import numpy as np
 import time
+from scipy.sparse import coo_matrix, csr_matrix, vstack # Added vstack import here
+from typing import Dict, Any, Tuple, List, Optional # Add typing
+from lp_model import LpData # Import the model
 
-def parse_mps(path):
-    """Parse an MPS file into a format suitable for simplex solver."""
+def parse_mps(path: str) -> LpData: # Update return type hint
+    """Parse an MPS file and return an LpData object."""
     parse_start_time = time.time()
     print(f"Starting MPS parsing...")
     
@@ -121,77 +124,125 @@ def parse_mps(path):
     print(f"Starting matrix conversion...")
     
     n_vars = len(col_names)
-    n_constraints = len(row_names) - 1  # Excluding objective row
+    n_constraints_total = len(row_names) - 1 # Excluding objective row
     
-    # Create coefficient matrix A and RHS vector b
-    A = np.zeros((n_constraints, n_vars))
-    b = np.zeros(n_constraints)
+    # Create dictionaries for sparse matrix construction (COO format)
+    row_ind = []
+    col_ind = []
+    data = []
     
+    constraint_rhs = {}
+    constraint_types = {}
+    
+    # Map names to indices
+    col_to_idx = {name: i for i, name in enumerate(col_names)}
+    row_to_idx = {}
+    constraint_idx = 0
+    for name in row_names:
+        if name != objective_name:
+            row_to_idx[name] = constraint_idx
+            constraint_rhs[constraint_idx] = rhs_values.get(name, 0.0)
+            constraint_types[constraint_idx] = row_types[name]
+            constraint_idx += 1
+
     # Fill objective coefficients
     c = np.zeros(n_vars)
-    for i, col in enumerate(col_names):
-        c[i] = objective.get(col, 0.0)
+    for col_name, value in objective.items():
+        if col_name in col_to_idx: # Check if column exists
+            c[col_to_idx[col_name]] = value
     
-    # Fill constraint matrix and RHS
-    constraint_idx = 0
-    constraint_types = []
-    
-    for row in row_names:
-        if row == objective_name:
-            continue
-        
-        row_type = row_types[row]
-        constraint_types.append(row_type)
-        
-        for j, col in enumerate(col_names):
-            if row in constraints and col in constraints[row]:
-                A[constraint_idx, j] = constraints[row][col]
-        
-        b[constraint_idx] = rhs_values.get(row, 0.0)
-        constraint_idx += 1
-    
+    # Fill constraint matrix data in COO format
+    for row_name, cols in constraints.items():
+        if row_name == objective_name:
+             continue # Should not happen based on previous logic, but safe check
+        if row_name not in row_to_idx:
+             print(f"Warning: Constraint row '{row_name}' found in COLUMNS but not in ROWS section. Skipping.")
+             continue
+        current_row_idx = row_to_idx[row_name]
+        for col_name, value in cols.items():
+            if col_name in col_to_idx:
+                 current_col_idx = col_to_idx[col_name]
+                 row_ind.append(current_row_idx)
+                 col_ind.append(current_col_idx)
+                 data.append(value)
+            else:
+                 print(f"Warning: Column '{col_name}' in constraint '{row_name}' not found in COLUMNS section list. Skipping coefficient.")
+
     # Set variable bounds
-    lb = np.array([bounds[col]["LO"] for col in col_names])
-    ub = np.array([bounds[col]["UP"] for col in col_names])
-    
-    # Split constraints by type
+    lb = np.zeros(n_vars)
+    ub = np.full(n_vars, float('inf')) # Default upper bound is infinity
+    for i, col in enumerate(col_names):
+        if col in bounds:
+            lb[i] = bounds[col]["LO"]
+            ub[i] = bounds[col]["UP"]
+        # Else defaults (lb=0, ub=inf) are already set
+
+    print(f"Matrix data gathered in {time.time() - matrix_start_time:.2f} seconds")
     split_start_time = time.time()
-    print(f"Matrix setup completed in {split_start_time - matrix_start_time:.2f} seconds")
-    print(f"Splitting constraints by type...")
+    print(f"Building and splitting constraint matrix...")
     
-    A_eq = []
-    b_eq = []
-    A_ineq = []
-    b_ineq = []
+    # Build the full sparse matrix (COO)
+    if n_constraints_total > 0 and len(data) > 0:
+        full_A_coo = coo_matrix((data, (row_ind, col_ind)), shape=(n_constraints_total, n_vars))
+        full_A = full_A_coo.tocsr() # Convert to CSR for efficient row slicing
+    else:
+        full_A = csr_matrix((n_constraints_total, n_vars))
+
+    # Prepare indices for splitting
+    eq_indices = [idx for idx, type in constraint_types.items() if type == 'E']
+    l_indices = [idx for idx, type in constraint_types.items() if type == 'L']
+    g_indices = [idx for idx, type in constraint_types.items() if type == 'G']
+
+    n_eq = len(eq_indices)
+    n_ineq = len(l_indices) + len(g_indices)
     
-    for i, row_type in enumerate(constraint_types):
-        if row_type == 'E':  # Equality
-            A_eq.append(A[i])
-            b_eq.append(b[i])
-        elif row_type == 'L':  # Less than
-            A_ineq.append(A[i])
-            b_ineq.append(b[i])
-        elif row_type == 'G':  # Greater than
-            A_ineq.append(-A[i])  # Negate to convert to ≤
-            b_ineq.append(-b[i])
-    
-    A_eq = np.array(A_eq) if A_eq else None
-    b_eq = np.array(b_eq) if b_eq else None
-    A_ineq = np.array(A_ineq) if A_ineq else None
-    b_ineq = np.array(b_ineq) if b_ineq else None
-    
+    A_eq: Optional[csr_matrix] = None
+    b_eq: np.ndarray = np.array([])
+    A_ineq: Optional[csr_matrix] = None
+    b_ineq: np.ndarray = np.array([])
+
+    if n_eq > 0:
+        A_eq = full_A[eq_indices, :]
+        b_eq = np.array([constraint_rhs[idx] for idx in eq_indices])
+        
+    if n_ineq > 0:
+        # Combine L and G constraints into a single inequality matrix (Ax <= b)
+        rows_L = full_A[l_indices, :] if l_indices else None
+        rhs_L = np.array([constraint_rhs[idx] for idx in l_indices]) if l_indices else np.array([])
+        
+        rows_G = -full_A[g_indices, :] if g_indices else None # Negate G constraints
+        rhs_G = np.array([-constraint_rhs[idx] for idx in g_indices]) if g_indices else np.array([]) # Negate G rhs
+        
+        # Stack L and G vertically if both exist
+        if rows_L is not None and rows_G is not None:
+            A_ineq = vstack([rows_L, rows_G], format='csr')
+            b_ineq = np.concatenate([rhs_L, rhs_G])
+        elif rows_L is not None:
+            A_ineq = rows_L
+            b_ineq = rhs_L
+        elif rows_G is not None:
+            A_ineq = rows_G
+            b_ineq = rhs_G
+        # Else (if n_ineq > 0 but both are None - should not happen), A_ineq/b_ineq remain None/[]
+        
     print(f"Constraint splitting completed in {time.time() - split_start_time:.2f} seconds")
     print(f"Total parsing time: {time.time() - parse_start_time:.2f} seconds")
     
-    return {
-        'c': c,
-        'A_eq': A_eq,
-        'b_eq': b_eq,
-        'A_ineq': A_ineq,
-        'b_ineq': b_ineq,
-        'bounds': (lb, ub),
-        'col_names': col_names,
-        'n_vars': n_vars,
-        'n_eq': len(b_eq) if b_eq is not None else 0,
-        'n_ineq': len(b_ineq) if b_ineq is not None else 0,
-    } 
+    # Create and return LpData instance
+    try:
+        lp_data_obj = LpData(
+            n_vars=n_vars,
+            c=c,
+            bounds=(lb, ub),
+            A_eq=A_eq, 
+            b_eq=b_eq,
+            A_ineq=A_ineq,
+            b_ineq=b_ineq,
+            obj_offset=0.0, # Default obj_offset
+            col_names=col_names,
+        )
+        return lp_data_obj
+    except Exception as e:
+        print(f"Error creating LpData object in parse_mps: {e}")
+        # Handle error appropriately, maybe raise it or return a default/error state
+        raise e 
