@@ -1,0 +1,5 @@
+- The matching rate is high, which means the parse is mostly correct. Mismatches are expected when we reach the time limit. 
+- Absolute time difference is not always positive because some Python code is involved to convert from Parquet to HiGHS. The gain is between 10 and 100 ms. 
+- In relative terms, we obtain a 1.2x speedup. 
+- Converting from MPS to Parquet is the bottleneck in this setup. For ~25% of the instances, it takes more than 10 seconds to do the conversion. This is not critical because it is a one-time cost that can be done offline. 
+- Other advantages of Parquet: smaller footprint on disk and structured data (less ambiguity on how to parse the data), compatible with big data libraries. 

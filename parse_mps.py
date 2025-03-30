@@ -1,12 +1,12 @@
 import numpy as np
 import time
-from scipy.sparse import coo_matrix, csr_matrix, vstack # Added vstack import here
-from typing import Dict, Any, Tuple, List, Optional # Add typing
-from lp_model import LpData # Import the model
+from scipy.sparse import coo_matrix, csr_matrix, vstack
+from typing import Optional 
+from lp_model import LpData 
 
-TIMEOUT_SECONDS = 120 # Define the timeout duration
+TIMEOUT_SECONDS = 1000
 
-def parse_mps(path: str) -> LpData: # Update return type hint
+def parse_mps(path: str) -> LpData: 
     """Parse an MPS file and return an LpData object."""
     parse_start_time = time.time()
     print(f"Starting MPS parsing...")

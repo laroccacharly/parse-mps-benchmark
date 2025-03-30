@@ -16,7 +16,7 @@ def get_instances_names_sorted():
     instances_df = get_instances() 
     instances_df = instances_df.sort("n_variables")
     instances = instances_df["instance_name"].to_list()
-    instances = instances[100:200]
+    instances = instances[:200]
     return instances
 
 def process_instance(instance_name: str):
