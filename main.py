@@ -1,102 +1,131 @@
-from miplib_benchmark.instance import get_instance_names, get_instance_path
+from miplib_benchmark.instance import get_instance_path, get_instances
 import highspy
 import numpy as np
 import time
-from parse_mps import parse_mps
-import os
-import pandas as pd
-import json
 from scipy.sparse import coo_matrix
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Dict, Any
 from lp_model import LpData
+from load_from_parquet import load_lp_from_parquet
+import os
+import json
 
-def main():
-    instance_names = get_instance_names()
-    # Let's use a smaller instance for faster testing, e.g., '25fv47'
-    # Adjust if needed, or stick with the first one
-    instance_name = '25fv47' # instance_names[0]
-    # Ensure the chosen instance exists
-    if instance_name not in instance_names:
-        print(f"Warning: Instance '{instance_name}' not found in miplib_benchmark. Using first instance: {instance_names[0]}")
-        instance_name = instance_names[0]
-        
+# Define the results directory as a constant
+RESULTS_DIR = "data/runtime-benchmark"
+
+def get_instances_names_sorted(): 
+    instances_df = get_instances() 
+    instances_df = instances_df.sort("n_variables")
+    instances = instances_df["instance_name"].to_list()
+    instances = instances[100:200]
+    return instances
+
+def process_instance(instance_name: str):
+    """Processes a single instance: benchmarks and saves results if not already present."""
+    # Use the constant RESULTS_DIR defined at the module level
+    result_filepath = os.path.join(RESULTS_DIR, f"{instance_name}_results.json")
+
+    if os.path.exists(result_filepath):
+        print(f"Results file already exists for {instance_name}, skipping.")
+        print("-" * (25 + len(instance_name))) # Separator
+        return # Skip this instance
+
+    # If file doesn't exist, proceed with benchmarking
     path = get_instance_path(instance_name)
     print(f"Using MPS file: {path}")
 
-    # 1. Solve directly with HiGHS
-    print("\nSolving directly with HiGHS...")
+    print("\nSolving from mps file...")
     start_time_direct = time.time()
-    direct_highs_result = solve_with_highs(path)
-    solve_time_direct = time.time() - start_time_direct
-    print(f"Direct HiGHS solve time: {solve_time_direct:.4f} seconds")
-
-    # 2. Parse the MPS file
-    print("\nParsing MPS file...")
-    start_time_parse = time.time()
     try:
-        # Parse MPS now returns an LpData object directly
-        lp_data_parsed = parse_mps(path)
-        parse_time = time.time() - start_time_parse
-        print(f"MPS parsing completed in {parse_time:.4f} seconds")
+        direct_highs_result = solve_from_mps(path)
+        solve_time_direct = time.time() - start_time_direct
+        print(f"Direct HiGHS solve time: {solve_time_direct:.4f} seconds")
+        obj_direct = direct_highs_result['objective_function_value']
     except Exception as e:
-        print(f"Error during MPS parsing or data validation: {e}")
-        return
+        print(f"Error solving directly from MPS for {instance_name}: {e}")
+        solve_time_direct = time.time() - start_time_direct
+        obj_direct = None
+        direct_highs_result = {'status': 'Error', 'info': str(e)}
 
-    # 3. Solve using parsed data with HiGHS
-    print("\nSolving with HiGHS using initially parsed data...")
-    start_time_parsed = time.time()
-    parsed_highs_result = solve_with_parsed_data(lp_data_parsed)
-    solve_time_parsed = time.time() - start_time_parsed
-    print(f"Parsed data HiGHS solve time: {solve_time_parsed:.4f} seconds")
-    
-    # 3.5 Save parsed data to Parquet
-    print("\nSaving parsed data to Parquet...")
-    parquet_dir, save_time = save_lp_to_parquet(lp_data_parsed, instance_name)
-    
-    # 3.6 Load data from Parquet
-    print("\nLoading data from Parquet...")
-    lp_data_parquet, load_time = load_lp_from_parquet(instance_name)
+    print("\nLoading data from Parquet (or creating if needed)...")
+    # The second return value 'load_time' now represents total time for this step
+    # (either just loading, or parsing+saving+loading)
+    try:
+        lp_data_parquet, combined_load_time = load_lp_from_parquet(instance_name, path)
+        parquet_loaded = True
+    except Exception as e:
+        print(f"Error loading/creating Parquet for {instance_name}: {e}")
+        combined_load_time = 0.0 # Or time taken until error
+        lp_data_parquet = None
+        parquet_loaded = False
+        parquet_highs_result = {'status': 'Error', 'info': 'Parquet loading failed'}
+        solve_time_parquet = 0.0
+        obj_parquet = None
 
-    # 3.7 Solve using Parquet-loaded data with HiGHS
-    print("\nSolving with HiGHS using Parquet-loaded data...")
-    start_time_parquet = time.time()
-    # Re-use the same solver function as it expects the same LpData structure
-    parquet_highs_result = solve_with_parsed_data(lp_data_parquet)
-    solve_time_parquet = time.time() - start_time_parquet
-    print(f"Parquet data HiGHS solve time: {solve_time_parquet:.4f} seconds")
+    if parquet_loaded:
+        print("\nSolving with HiGHS using Parquet-loaded data...")
+        start_time_parquet_solve = time.time()
+        try:
+            parquet_highs_result = solve_from_lp_data(lp_data_parquet)
+            solve_time_parquet = time.time() - start_time_parquet_solve
+            print(f"Parquet data HiGHS solve time: {solve_time_parquet:.4f} seconds")
+            obj_parquet = parquet_highs_result.get('objective_value')
+        except Exception as e:
+            print(f"Error solving from Parquet data for {instance_name}: {e}")
+            solve_time_parquet = time.time() - start_time_parquet_solve
+            obj_parquet = None
+            parquet_highs_result = {'status': 'Error', 'info': str(e)}
 
-    # 4. Compare results
+    # 4. Compare and store results
     print("\n--- Results Comparison ---")
     print(f"Instance:                 {instance_name}")
-    print(f"Direct HiGHS Objective:   {direct_highs_result['objective_function_value']:.8f} (Solve time: {solve_time_direct:.4f}s)")
-    print(f"Parsed HiGHS Objective:   {parsed_highs_result.get('objective_value', 'N/A'):.8f} (Parse time: {parse_time:.4f}s, Solve time: {solve_time_parsed:.4f}s)")
-    print(f"Parquet HiGHS Objective:  {parquet_highs_result.get('objective_value', 'N/A'):.8f} (Save time: {save_time:.4f}s, Load time: {load_time:.4f}s, Solve time: {solve_time_parquet:.4f}s)")
-    
-    obj_direct = direct_highs_result['objective_function_value']
-    obj_parsed = parsed_highs_result.get('objective_value')
-    obj_parquet = parquet_highs_result.get('objective_value')
-
-    if obj_parsed is not None:
-        diff_parsed = abs(obj_direct - obj_parsed)
-        print(f"Difference (Direct vs Parsed):   {diff_parsed:.8f} {'(Match!)' if diff_parsed < 1e-6 else '(DIFFER!)'}")
+    print(f"Direct HiGHS Objective:   {obj_direct if obj_direct is not None else 'N/A'} (Solve time: {solve_time_direct:.4f}s)")
+    if parquet_loaded:
+        print(f"Parquet HiGHS Objective:  {obj_parquet if obj_parquet is not None else 'N/A'} (Load/Create time: {combined_load_time:.4f}s, Solve time: {solve_time_parquet:.4f}s)")
     else:
-        print("Could not compare Direct vs Parsed (Parsed solve failed?).")
+        print("Parquet HiGHS Objective:  N/A (Load/Create failed)")
 
-    if obj_parquet is not None:
+    if obj_direct is not None and obj_parquet is not None:
         diff_parquet = abs(obj_direct - obj_parquet)
         print(f"Difference (Direct vs Parquet):  {diff_parquet:.8f} {'(Match!)' if diff_parquet < 1e-6 else '(DIFFER!)'}")
     else:
-        print("Could not compare Direct vs Parquet (Parquet solve failed?).")
+        print("Difference (Direct vs Parquet):  N/A (Could not compare)")
 
-    # Optional: Compare status
-    # print(f"Direct HiGHS Status: {direct_highs_result.model_status}") # Requires getting status correctly
-    # print(f"Parsed HiGHS Status: {parsed_highs_result.get('status', 'N/A')}")
-    # print(f"Parquet HiGHS Status: {parquet_highs_result.get('status', 'N/A')}")
+    # 5. Save results to JSON (flattened structure)
+    results_data = {
+        "instance_name": instance_name,
+        
+        "direct_objective_value": obj_direct,
+        "direct_solve_time_seconds": solve_time_direct,
+        "parquet_load_create_time_seconds": combined_load_time if parquet_loaded else None,
+        "parquet_objective_value": obj_parquet if parquet_loaded else None,
+        "parquet_solve_time_seconds": solve_time_parquet if parquet_loaded else None,
 
-def solve_with_highs(path: str) -> Dict[str, Any]:
+    }
+
+    try:
+        with open(result_filepath, 'w') as f:
+            json.dump(results_data, f, indent=4)
+        print(f"Results saved to {result_filepath}")
+    except IOError as e:
+        print(f"Error writing results file {result_filepath}: {e}")
+
+    print("-" * (25 + len(instance_name))) # Separator
+
+def main():
+    instance_names = get_instances_names_sorted()
+    total_instances = len(instance_names) 
+    os.makedirs(RESULTS_DIR, exist_ok=True) 
+
+    for i, instance_name in enumerate(instance_names):
+        print(f"--- Processing instance {i+1}/{total_instances}: {instance_name} ---")
+
+        process_instance(instance_name)
+
+def solve_from_mps(path: str) -> Dict[str, Any]:
     model = highspy.Highs()
     model.setOptionValue("time_limit", 20.0) # Using float
     model.setOptionValue("solver", "simplex")
+    model.setOptionValue("log_to_console", "false")
     model.readModel(str(path))
     model.run()
     info = model.getInfo()
@@ -106,12 +135,13 @@ def solve_with_highs(path: str) -> Dict[str, Any]:
     # Return a dict for consistency
     return {'objective_function_value': obj_val, 'status': status, 'info': info}
 
-def solve_with_parsed_data(lp_data: LpData) -> Dict[str, Any]:
+def solve_from_lp_data(lp_data: LpData) -> Dict[str, Any]:
     """Solve the LP using HiGHS, loading data from the LpData model."""
     model = highspy.Highs()
     model.setOptionValue("time_limit", 20.0)
     model.setOptionValue("solver", "simplex")
-    
+    model.setOptionValue("log_to_console", "false")
+
     num_var = lp_data.n_vars
     c = lp_data.c
     lb, ub = lp_data.bounds
@@ -232,128 +262,6 @@ def solve_with_parsed_data(lp_data: LpData) -> Dict[str, Any]:
     
     model.clear()
     return result_dict
-
-def save_lp_to_parquet(lp_data: LpData, instance_name: str) -> Tuple[str, float]:
-    """Saves LpData components to Parquet files inside a 'data' directory."""
-    start_time = time.time()
-    # Define the base data directory
-    base_data_dir = "data"
-    # Create the instance-specific directory path
-    output_dir = os.path.join(base_data_dir, f"{instance_name}_parquet")
-    # Create the base and instance-specific directories (exist_ok=True handles both)
-    os.makedirs(output_dir, exist_ok=True)
-    print(f"Saving data to directory: {output_dir}")
-
-    metadata = {
-        'n_vars': lp_data.n_vars,
-        # n_eq/n_ineq are derived properties in LpData, no need to store explicitly
-        'obj_offset': lp_data.obj_offset 
-    }
-
-    # Save metadata
-    with open(os.path.join(output_dir, 'metadata.json'), 'w') as f:
-        json.dump(metadata, f)
-
-    # Save vectors
-    pd.DataFrame({'c': lp_data.c}).to_parquet(os.path.join(output_dir, 'c.parquet'))
-    lb, ub = lp_data.bounds
-    pd.DataFrame({'lb': lb, 'ub': ub}).to_parquet(os.path.join(output_dir, 'bounds.parquet'))
-
-    if lp_data.b_eq.size > 0:
-        pd.DataFrame({'b_eq': lp_data.b_eq}).to_parquet(os.path.join(output_dir, 'b_eq.parquet'))
-    if lp_data.b_ineq.size > 0:
-        pd.DataFrame({'b_ineq': lp_data.b_ineq}).to_parquet(os.path.join(output_dir, 'b_ineq.parquet'))
-
-    # Save sparse matrix components (COO format) into single files
-    def save_coo_matrix(row: Optional[np.ndarray], col: Optional[np.ndarray], data: Optional[np.ndarray], filename: str):
-        # Ensure all components are present and non-empty before saving
-        if row is not None and col is not None and data is not None and row.size > 0:
-            # Assert they have the same size, just in case
-            assert row.size == col.size == data.size, f"COO component size mismatch for {filename}"
-            df = pd.DataFrame({'row': row, 'col': col, 'data': data})
-            df.to_parquet(filename)
-        # else: If any component is None or empty, don't save the file. Loader will handle missing files.
-
-    save_coo_matrix(lp_data.A_eq_row, lp_data.A_eq_col, lp_data.A_eq_data, os.path.join(output_dir, 'A_eq_coo.parquet'))
-    save_coo_matrix(lp_data.A_ineq_row, lp_data.A_ineq_col, lp_data.A_ineq_data, os.path.join(output_dir, 'A_ineq_coo.parquet'))
-
-    save_time = time.time() - start_time
-    print(f"Finished saving to Parquet in {save_time:.4f} seconds")
-    # Return the path relative to the workspace root
-    return output_dir, save_time
-
-
-def load_lp_from_parquet(instance_name: str) -> Tuple[LpData, float]:
-    """Loads LP data components from Parquet files inside a 'data' directory."""
-    start_time = time.time()
-    # Define the path to the instance-specific directory within 'data'
-    base_data_dir = "data"
-    data_dir = os.path.join(base_data_dir, f"{instance_name}_parquet")
-    print(f"Loading data from directory: {data_dir}")
-    
-    # Check if the directory exists before proceeding
-    if not os.path.isdir(data_dir):
-        print(f"Error: Data directory not found: {data_dir}")
-        raise FileNotFoundError(f"Data directory not found: {data_dir}")
-        
-    lp_data_dict = {}
-
-    # Load metadata
-    with open(os.path.join(data_dir, 'metadata.json'), 'r') as f:
-        metadata = json.load(f)
-
-    lp_data_dict['n_vars'] = metadata['n_vars']
-    lp_data_dict['obj_offset'] = metadata.get('obj_offset', 0.0)
-
-    # Load vectors
-    lp_data_dict['c'] = pd.read_parquet(os.path.join(data_dir, 'c.parquet'))['c'].to_numpy()
-    bounds_df = pd.read_parquet(os.path.join(data_dir, 'bounds.parquet'))
-    lp_data_dict['bounds'] = (bounds_df['lb'].to_numpy(), bounds_df['ub'].to_numpy())
-
-    b_eq_path = os.path.join(data_dir, 'b_eq.parquet')
-    if os.path.exists(b_eq_path):
-        lp_data_dict['b_eq'] = pd.read_parquet(b_eq_path)['b_eq'].to_numpy()
-    else:
-         lp_data_dict['b_eq'] = np.array([])
-
-    b_ineq_path = os.path.join(data_dir, 'b_ineq.parquet')
-    if os.path.exists(b_ineq_path):
-        lp_data_dict['b_ineq'] = pd.read_parquet(b_ineq_path)['b_ineq'].to_numpy()
-    else:
-        lp_data_dict['b_ineq'] = np.array([])
-
-    # Load sparse matrix COO components from single files
-    def load_coo_matrix(filename: str) -> Tuple[Optional[np.ndarray], Optional[np.ndarray], Optional[np.ndarray]]:
-         if not os.path.exists(filename):
-             return None, None, None
-         df = pd.read_parquet(filename)
-         if df.empty:
-             # Return None for all components if the file was empty
-             return None, None, None
-         # Check if expected columns exist
-         if 'row' in df.columns and 'col' in df.columns and 'data' in df.columns:
-            return df['row'].to_numpy(), df['col'].to_numpy(), df['data'].to_numpy()
-         else:
-             print(f"Warning: Parquet file {filename} missing expected columns ('row', 'col', 'data'). Returning None.")
-             return None, None, None
-
-    lp_data_dict['A_eq_row'], lp_data_dict['A_eq_col'], lp_data_dict['A_eq_data'] = load_coo_matrix(os.path.join(data_dir, 'A_eq_coo.parquet'))
-    lp_data_dict['A_ineq_row'], lp_data_dict['A_ineq_col'], lp_data_dict['A_ineq_data'] = load_coo_matrix(os.path.join(data_dir, 'A_ineq_coo.parquet'))
-
-    # Add col_names if needed (assuming not saved currently)
-    lp_data_dict['col_names'] = None 
-
-    # Create LpData instance
-    try:
-        lp_data = LpData(**lp_data_dict)
-    except Exception as e:
-        print(f"Error creating LpData model from loaded data: {e}")
-        # Consider raising the exception or returning a specific error state
-        raise e # Re-raise for now
-        
-    load_time = time.time() - start_time
-    print(f"Finished loading from Parquet in {load_time:.4f} seconds")
-    return lp_data, load_time
 
 if __name__ == "__main__":
     main()

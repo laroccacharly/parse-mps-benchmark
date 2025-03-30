@@ -4,6 +4,8 @@ from scipy.sparse import coo_matrix, csr_matrix, vstack # Added vstack import he
 from typing import Dict, Any, Tuple, List, Optional # Add typing
 from lp_model import LpData # Import the model
 
+TIMEOUT_SECONDS = 120 # Define the timeout duration
+
 def parse_mps(path: str) -> LpData: # Update return type hint
     """Parse an MPS file and return an LpData object."""
     parse_start_time = time.time()
@@ -23,7 +25,13 @@ def parse_mps(path: str) -> LpData: # Update return type hint
     row_types = {}
     
     with open(path, 'r') as f:
-        for line in f:
+        for line_num, line in enumerate(f):
+            # Check for timeout periodically (e.g., every 100 lines for efficiency)
+            if line_num % 100 == 0:
+                 current_time = time.time()
+                 if current_time - parse_start_time > TIMEOUT_SECONDS:
+                     raise TimeoutError(f"MPS parsing exceeded timeout of {TIMEOUT_SECONDS} seconds.")
+
             line = line.strip()
             if not line or line.startswith('*'):
                 continue
