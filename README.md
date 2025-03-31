@@ -1,6 +1,6 @@
 # parse-mps-benchmark 
 
-Title: Replacing MPS with Parquet, is it a good idea? 
+Replacing MPS with Parquet, is it a good idea? 
 
 [![Watch the presentation](https://img.youtube.com/vi/BQ9Mk00q-II/0.jpg)](https://youtu.be/BQ9Mk00q-II)
 
